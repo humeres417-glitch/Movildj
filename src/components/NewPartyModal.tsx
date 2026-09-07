@@ -2,6 +2,7 @@ import { useState, useEffect, type FormEvent } from 'react';
 import { Sparkles, X, Plus, Radio, ArrowRight } from 'lucide-react';
 import { Party } from '../types';
 import { MovilDjLogo } from './MovilDjLogo';
+import { getLocalParties, createLocalParty } from '../lib/localStore';
 
 interface NewPartyModalProps {
   isOpen: boolean;
@@ -23,11 +24,24 @@ export function NewPartyModal({ isOpen, currentPartyCode, onClose, onSelectParty
   useEffect(() => {
     if (isOpen) {
       fetch('/api/parties')
-        .then((res) => res.json())
-        .then((data) => {
-          if (data.parties) setExistingParties(data.parties);
+        .then((res) => {
+          const contentType = res.headers.get('content-type') || '';
+          if (res.ok && contentType.includes('application/json')) {
+            return res.json();
+          }
+          throw new Error('Not JSON');
         })
-        .catch((err) => console.error('Error fetching parties', err));
+        .then((data) => {
+          if (data.parties && data.parties.length > 0) {
+            setExistingParties(data.parties);
+          } else {
+            setExistingParties(getLocalParties());
+          }
+        })
+        .catch(() => {
+          // Fallback to local parties
+          setExistingParties(getLocalParties());
+        });
     }
   }, [isOpen]);
 
@@ -43,25 +57,37 @@ export function NewPartyModal({ isOpen, currentPartyCode, onClose, onSelectParty
 
     try {
       setIsCreating(true);
-      const res = await fetch('/api/parties', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: name.trim(),
-          djName: djName.trim() || 'DJ',
-          genre: genre.trim() || 'Open Format',
-          location: location.trim() || 'Pista Principal',
-          customCode: customCode.trim() || undefined,
-        }),
-      });
+      const payload = {
+        name: name.trim(),
+        djName: djName.trim() || 'DJ',
+        genre: genre.trim() || 'Open Format',
+        location: location.trim() || 'Pista Principal',
+        customCode: customCode.trim() || undefined,
+      };
 
-      if (!res.ok) {
-        const d = await res.json().catch(() => ({}));
-        throw new Error(d.error || 'Error al crear la fiesta');
+      try {
+        const res = await fetch('/api/parties', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
+          const data = await res.json();
+          if (data && data.party) {
+            onSelectParty(data.party.code);
+            onClose();
+            return;
+          }
+        }
+      } catch {
+        // Backend unavailable, fallback to localStore
       }
 
-      const data = await res.json();
-      onSelectParty(data.party.code);
+      // LocalStore fallback
+      const localParty = createLocalParty(payload);
+      onSelectParty(localParty.code);
       onClose();
     } catch (err: any) {
       setError(err?.message || 'Error al crear la fiesta');

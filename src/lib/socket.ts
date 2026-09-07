@@ -1,5 +1,16 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { Party, SongRequest, WSMessage } from '../types';
+import {
+  getLocalParty,
+  getLocalParties,
+  addLocalRequest,
+  voteLocalRequest,
+  updateLocalRequestStatus,
+  deleteLocalRequest,
+  updateLocalParty,
+  subscribeToLocalEvents,
+  DEFAULT_PARTY_CODE,
+} from './localStore';
 
 export function getClientId(): string {
   let id = localStorage.getItem('dj_client_id');
@@ -26,35 +37,74 @@ export function usePartyRealtime({ partyCode, role }: UsePartyRealtimeProps) {
   const sseRef = useRef<EventSource | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
 
-  // Fetch initial REST data
+  // Fetch initial REST data with automatic fallback to LocalStore for Vercel / offline deployments
   const fetchPartyData = useCallback(async (code: string) => {
+    const normalized = (code || DEFAULT_PARTY_CODE).trim().toUpperCase();
     try {
       setIsLoading(true);
-      const res = await fetch(`/api/parties/${encodeURIComponent(code)}`);
-      if (!res.ok) {
-        if (res.status === 404) {
-          setError(`La fiesta "${code}" no existe.`);
-        } else {
-          setError('Error al cargar la fiesta.');
+      const res = await fetch(`/api/parties/${encodeURIComponent(normalized)}`);
+      const contentType = res.headers.get('content-type') || '';
+
+      if (res.ok && contentType.includes('application/json')) {
+        const data = await res.json();
+        if (data && data.party) {
+          setParty(data.party);
+          setRequests(data.requests || []);
+          setError(null);
+          setIsLoading(false);
+          // Keep local store updated in background
+          updateLocalParty(data.party.code, data.party);
+          return true;
         }
-        setIsLoading(false);
-        return false;
       }
-      const data = await res.json();
-      setParty(data.party);
-      setRequests(data.requests || []);
-      setError(null);
+
+      // If server returned 404, HTML (Vercel SPA fallback), or error: check local store
+      const local = getLocalParty(normalized);
+      if (local && local.party) {
+        setParty(local.party);
+        setRequests(local.requests || []);
+        setError(null);
+        setIsLoading(false);
+        setIsConnected(true);
+        return true;
+      }
+
+      // If normalized is default and not found, localStore auto-seeds it
+      if (normalized === DEFAULT_PARTY_CODE) {
+        const seeded = getLocalParty(DEFAULT_PARTY_CODE);
+        if (seeded) {
+          setParty(seeded.party);
+          setRequests(seeded.requests);
+          setError(null);
+          setIsLoading(false);
+          setIsConnected(true);
+          return true;
+        }
+      }
+
+      setError(`La fiesta "${normalized}" no existe.`);
       setIsLoading(false);
-      return true;
+      return false;
     } catch (err: any) {
-      console.error('Fetch party error:', err);
+      console.warn('Network fetch failed, activating local storage fallback:', err);
+      // Fallback seamlessly to local storage
+      const local = getLocalParty(normalized);
+      if (local && local.party) {
+        setParty(local.party);
+        setRequests(local.requests || []);
+        setError(null);
+        setIsLoading(false);
+        setIsConnected(true);
+        return true;
+      }
+
       setError('No se pudo conectar con el servidor.');
       setIsLoading(false);
       return false;
     }
   }, []);
 
-  // Connect WebSocket with SSE fallback
+  // Connect WebSocket & SSE with Local Events fallback
   useEffect(() => {
     if (!partyCode) return;
     const normalizedCode = partyCode.toUpperCase();
@@ -63,23 +113,31 @@ export function usePartyRealtime({ partyCode, role }: UsePartyRealtimeProps) {
     // Fetch initial state first
     fetchPartyData(normalizedCode);
 
+    // Listen to cross-tab / local events for Vercel / offline environments
+    const unsubscribeLocal = subscribeToLocalEvents((msg) => {
+      if (isCancelled) return;
+      handleIncomingMessage(msg);
+    });
+
     function setupWebSocket() {
       try {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${protocol}//${window.location.host}/ws?partyCode=${encodeURIComponent(normalizedCode)}&role=${role}`;
-        
+
         const ws = new WebSocket(wsUrl);
         wsRef.current = ws;
 
         ws.onopen = () => {
           if (isCancelled) return;
           setIsConnected(true);
-          ws.send(JSON.stringify({
-            type: 'join',
-            partyCode: normalizedCode,
-            role,
-            clientId: getClientId(),
-          }));
+          ws.send(
+            JSON.stringify({
+              type: 'join',
+              partyCode: normalizedCode,
+              role,
+              clientId: getClientId(),
+            })
+          );
         };
 
         ws.onmessage = (event) => {
@@ -94,19 +152,16 @@ export function usePartyRealtime({ partyCode, role }: UsePartyRealtimeProps) {
 
         ws.onclose = () => {
           if (isCancelled) return;
-          setIsConnected(false);
-          // Try reconnecting in 3 seconds
-          reconnectTimeoutRef.current = window.setTimeout(setupWebSocket, 3000);
+          // If WS closes, we might be on Vercel or disconnected, keep local connected flag
+          reconnectTimeoutRef.current = window.setTimeout(setupWebSocket, 5000);
         };
 
         ws.onerror = () => {
-          // If WS fails, setup SSE fallback
           if (!sseRef.current) {
             setupSSE();
           }
         };
-      } catch (err) {
-        console.error('WS setup error:', err);
+      } catch {
         setupSSE();
       }
     }
@@ -132,10 +187,14 @@ export function usePartyRealtime({ partyCode, role }: UsePartyRealtimeProps) {
         };
 
         sse.onerror = () => {
-          if (!isCancelled) setIsConnected(false);
+          // SSE failed or not supported by host (e.g. Vercel static)
+          if (!isCancelled) {
+            // Keep connected via local BroadcastChannel
+            setIsConnected(true);
+          }
         };
-      } catch (err) {
-        console.error('SSE setup error:', err);
+      } catch {
+        setIsConnected(true);
       }
     }
 
@@ -146,18 +205,17 @@ export function usePartyRealtime({ partyCode, role }: UsePartyRealtimeProps) {
       } else if (msg.type === 'party:updated') {
         setParty(msg.party);
       } else if (msg.type === 'request:created') {
-        setRequests(prev => {
-          if (prev.some(r => r.id === msg.request.id)) return prev;
+        setRequests((prev) => {
+          if (prev.some((r) => r.id === msg.request.id)) return prev;
           return [msg.request, ...prev];
         });
       } else if (msg.type === 'request:updated') {
-        setRequests(prev => prev.map(r => (r.id === msg.request.id ? msg.request : r)));
-        // Also update nowPlaying in party if relevant
+        setRequests((prev) => prev.map((r) => (r.id === msg.request.id ? msg.request : r)));
         if (msg.request.status === 'playing') {
-          setParty(prev => prev ? { ...prev, nowPlaying: msg.request } : null);
+          setParty((prev) => (prev ? { ...prev, nowPlaying: msg.request } : null));
         }
       } else if (msg.type === 'request:deleted') {
-        setRequests(prev => prev.filter(r => r.id !== msg.requestId));
+        setRequests((prev) => prev.filter((r) => r.id !== msg.requestId));
       }
     }
 
@@ -172,6 +230,7 @@ export function usePartyRealtime({ partyCode, role }: UsePartyRealtimeProps) {
 
     return () => {
       isCancelled = true;
+      unsubscribeLocal();
       clearInterval(pingInterval);
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
@@ -185,73 +244,126 @@ export function usePartyRealtime({ partyCode, role }: UsePartyRealtimeProps) {
     };
   }, [partyCode, role, fetchPartyData]);
 
-  // Actions
-  const submitRequest = async (payload: { title: string; artist: string; guestName?: string; dedication?: string; genre?: string }) => {
-    const res = await fetch(`/api/parties/${encodeURIComponent(partyCode)}/requests`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...payload, clientId: getClientId() }),
-    });
-    if (!res.ok) {
-      const errData = await res.json().catch(() => ({}));
-      throw new Error(errData.error || 'Error al enviar petición');
+  // Actions with automatic LocalStore Fallback
+  const submitRequest = async (payload: {
+    title: string;
+    artist: string;
+    guestName?: string;
+    dedication?: string;
+    genre?: string;
+  }) => {
+    try {
+      const res = await fetch(`/api/parties/${encodeURIComponent(partyCode)}/requests`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, clientId: getClientId() }),
+      });
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
+        const data = await res.json();
+        return data.request as SongRequest;
+      }
+    } catch {
+      // Backend unavailable, fallback to local store
     }
-    const data = await res.json();
-    return data.request as SongRequest;
+
+    // LocalStore fallback
+    const localReq = addLocalRequest(partyCode, { ...payload, clientId: getClientId() });
+    setRequests((prev) => [localReq, ...prev]);
+    return localReq;
   };
 
   const voteRequest = async (requestId: string) => {
-    const res = await fetch(`/api/parties/${encodeURIComponent(partyCode)}/requests/${requestId}/vote`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ clientId: getClientId() }),
-    });
-    if (!res.ok) {
-      const errData = await res.json().catch(() => ({}));
-      throw new Error(errData.error || 'Error al votar');
+    try {
+      const res = await fetch(
+        `/api/parties/${encodeURIComponent(partyCode)}/requests/${requestId}/vote`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ clientId: getClientId() }),
+        }
+      );
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
+        const data = await res.json();
+        return data;
+      }
+    } catch {
+      // Backend unavailable
     }
-    const data = await res.json();
-    return data;
+
+    // LocalStore fallback
+    const result = voteLocalRequest(partyCode, requestId, getClientId());
+    setRequests((prev) => prev.map((r) => (r.id === requestId ? result.request : r)));
+    return result;
   };
 
-  const updateRequestStatus = async (requestId: string, status: SongRequest['status'], rejectReason?: string) => {
-    const res = await fetch(`/api/parties/${encodeURIComponent(partyCode)}/requests/${requestId}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status, rejectReason }),
-    });
-    if (!res.ok) {
-      const errData = await res.json().catch(() => ({}));
-      throw new Error(errData.error || 'Error al actualizar estado');
+  const updateRequestStatus = async (
+    requestId: string,
+    status: SongRequest['status'],
+    rejectReason?: string
+  ) => {
+    try {
+      const res = await fetch(`/api/parties/${encodeURIComponent(partyCode)}/requests/${requestId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status, rejectReason }),
+      });
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
+        const data = await res.json();
+        return data.request as SongRequest;
+      }
+    } catch {
+      // Backend unavailable
     }
-    const data = await res.json();
-    return data.request as SongRequest;
+
+    // LocalStore fallback
+    const updated = updateLocalRequestStatus(partyCode, requestId, status, rejectReason);
+    setRequests((prev) => prev.map((r) => (r.id === requestId ? updated : r)));
+    if (status === 'playing') {
+      setParty((prev) => (prev ? { ...prev, nowPlaying: updated } : null));
+    }
+    return updated;
   };
 
   const deleteRequest = async (requestId: string) => {
-    const res = await fetch(`/api/parties/${encodeURIComponent(partyCode)}/requests/${requestId}`, {
-      method: 'DELETE',
-    });
-    if (!res.ok) {
-      const errData = await res.json().catch(() => ({}));
-      throw new Error(errData.error || 'Error al eliminar petición');
+    try {
+      const res = await fetch(`/api/parties/${encodeURIComponent(partyCode)}/requests/${requestId}`, {
+        method: 'DELETE',
+      });
+      if (res.ok) {
+        return true;
+      }
+    } catch {
+      // Backend unavailable
     }
+
+    deleteLocalRequest(partyCode, requestId);
+    setRequests((prev) => prev.filter((r) => r.id !== requestId));
     return true;
   };
 
   const updateParty = async (updates: Partial<Party>) => {
-    const res = await fetch(`/api/parties/${encodeURIComponent(partyCode)}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(updates),
-    });
-    if (!res.ok) {
-      const errData = await res.json().catch(() => ({}));
-      throw new Error(errData.error || 'Error al actualizar fiesta');
+    try {
+      const res = await fetch(`/api/parties/${encodeURIComponent(partyCode)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updates),
+      });
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
+        const data = await res.json();
+        setParty(data.party);
+        return data.party as Party;
+      }
+    } catch {
+      // Backend unavailable
     }
-    const data = await res.json();
-    setParty(data.party);
-    return data.party as Party;
+
+    const updated = updateLocalParty(partyCode, updates);
+    setParty(updated);
+    return updated;
   };
 
   return {

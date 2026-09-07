@@ -97,17 +97,35 @@ export default function App() {
   if (error && !party) {
     return (
       <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center text-white p-4 font-sans">
-        <div className="p-6 bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full text-center space-y-4">
+        <div className="p-6 bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full text-center space-y-4 shadow-2xl">
+          <div className="flex justify-center pb-2">
+            <MovilDjLogo size="sm" subtitle="Peticiones en Vivo" />
+          </div>
           <AlertCircle className="w-10 h-10 text-rose-400 mx-auto" />
           <h2 className="text-lg font-bold text-white">No se encontró la fiesta</h2>
           <p className="text-xs text-slate-400">{error}</p>
-          <button
-            onClick={() => handleSelectParty('FIESTA-VIP')}
-            className="w-full py-2.5 bg-amber-500 text-slate-950 font-bold text-xs rounded-xl hover:bg-amber-400 transition"
-          >
-            Ir a Fiesta Principal (FIESTA-VIP)
-          </button>
+          <div className="flex flex-col gap-2 pt-2">
+            <button
+              onClick={() => handleSelectParty('FIESTA-VIP')}
+              className="w-full py-2.5 bg-gradient-to-r from-amber-500 to-amber-400 text-slate-950 font-bold text-xs rounded-xl hover:from-amber-400 hover:to-amber-300 transition shadow-lg shadow-amber-500/20"
+            >
+              Ir a Fiesta Principal (FIESTA-VIP)
+            </button>
+            <button
+              onClick={() => setIsNewPartyOpen(true)}
+              className="w-full py-2.5 bg-slate-800 text-slate-200 font-bold text-xs rounded-xl hover:bg-slate-700 transition border border-slate-700"
+            >
+              Crear Nueva Fiesta
+            </button>
+          </div>
         </div>
+
+        <NewPartyModal
+          isOpen={isNewPartyOpen}
+          currentPartyCode={partyCode}
+          onClose={() => setIsNewPartyOpen(false)}
+          onSelectParty={handleSelectParty}
+        />
       </div>
     );
   }
