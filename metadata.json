@@ -1,0 +1,6 @@
+{
+  "name": "MOVILDJ",
+  "description": "Aplicación para DJs donde los invitados solicitan canciones en tiempo real escaneando el código QR exclusivo de la fiesta.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
